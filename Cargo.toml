@@ -1,6 +1,11 @@
 [package]
 name = "waker-waiter"
 version = "0.1.0"
+authors = ["Justin Karneges <justin@karneges.com>"]
+license = "MIT"
+description = "Helps async runtimes interoperate with arbitrary futures"
+repository = "https://github.com/jkarneges/waker-waiter"
+readme = "README.md"
 edition = "2021"
 
 [dependencies]
