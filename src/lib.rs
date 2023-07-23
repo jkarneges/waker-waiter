@@ -1,8 +1,8 @@
 //! This library helps async runtimes support the execution of arbitrary futures, by enabling futures to provide their own event polling logic. It is an attempt to implement the approach described by [Context reactor hook](https://jblog.andbit.net/2022/12/28/context-reactor-hook/), except using thread locals instead of modifying [`std::task::Context`]. The hook essentially provides a thread-level effect, so having to resort to thread locals here is not limiting.
 //!
 //! There are two integration points:
-//! - Whatever part of the application is responsible for polling top-level futures (i.e. the async runtime) needs to implement the [`TopLevelPoller`] trait and call [`set_top_level_poller`] to make it discoverable.
 //! - Futures that need to run their own event polling logic in the execution thread must call [`with_top_level_poller`] and then [`TopLevelPoller::set_waiter`] to register a [`WakerWaiter`].
+//! - Whatever part of the application is responsible for polling top-level futures (i.e. the async runtime) needs to implement the [`TopLevelPoller`] trait and call [`set_top_level_poller`] to make it discoverable. This library provides such an implementation via [`block_on`].
 //!
 //! Only one [`WakerWaiter`] can be registerd on a [`TopLevelPoller`]. If more than one future relies on the same event polling logic, the futures should coordinate and share the same [`WakerWaiter`].
 //!
@@ -246,11 +246,107 @@ where
     })
 }
 
+mod executor {
+    use super::{set_top_level_poller, SetWaiterError, TopLevelPoller, WakerWaiter};
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake};
+    use std::thread::{self, Thread};
+
+    struct ThreadWaker {
+        thread: Thread,
+        waiter: Arc<Mutex<Option<WakerWaiter>>>,
+    }
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            if thread::current().id() == self.thread.id() {
+                // if we were woken in the same thread as execution,
+                // then the wake was caused by the WakerWaiter which
+                // will return control without any signaling needed
+                return;
+            }
+
+            if let Some(waiter) = &*self.waiter.lock().unwrap() {
+                // if a waiter was configured, then the execution thread
+                // will be blocking on it and we'll need to unblock it
+                waiter.cancel();
+            } else {
+                // if a waiter was not configured, then the execution
+                // thread will be asleep with a standard thread park
+                self.thread.unpark();
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct MyTopLevelPoller {
+        waiter: Arc<Mutex<Option<WakerWaiter>>>,
+    }
+
+    impl TopLevelPoller for MyTopLevelPoller {
+        fn set_waiter(&mut self, waiter: &WakerWaiter) -> Result<(), SetWaiterError> {
+            let self_waiter = &mut *self.waiter.lock().unwrap();
+
+            if let Some(cur) = self_waiter {
+                if cur == waiter {
+                    return Ok(()); // already set to this waiter
+                } else {
+                    return Err(SetWaiterError); // already set to a different waiter
+                }
+            }
+
+            *self_waiter = Some(waiter.clone());
+
+            Ok(())
+        }
+    }
+
+    pub fn block_on<T>(fut: T) -> T::Output
+    where
+        T: Future,
+    {
+        let waiter = Arc::new(Mutex::new(None));
+        let waker = Arc::new(ThreadWaker {
+            thread: thread::current(),
+            waiter: Arc::clone(&waiter),
+        })
+        .into();
+        let mut cx = Context::from_waker(&waker);
+        let poller = MyTopLevelPoller { waiter };
+
+        set_top_level_poller(Some(poller.clone()));
+
+        let mut fut = pin!(fut);
+
+        let res = loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(res) => break res,
+                Poll::Pending => {
+                    // if a waiter is configured then block on it. else do a
+                    // standard thread park
+                    match &*poller.waiter.lock().unwrap() {
+                        Some(waiter) => waiter.wait(),
+                        None => thread::park(),
+                    }
+                }
+            }
+        };
+
+        set_top_level_poller::<MyTopLevelPoller>(None);
+
+        res
+    }
+}
+
+pub use executor::block_on;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::pin::Pin;
+    use std::pin::{pin, Pin};
     use std::rc::Rc;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake};
@@ -341,7 +437,7 @@ mod tests {
         // NOTE: later on, this could become a property of Context
         set_top_level_poller(Some(Rc::clone(&poller)));
 
-        let mut fut = Box::pin(MyFuture::new());
+        let mut fut = pin!(MyFuture::new());
 
         loop {
             match fut.as_mut().poll(&mut cx) {
@@ -352,5 +448,10 @@ mod tests {
                 },
             }
         }
+    }
+
+    #[test]
+    fn test_block_on() {
+        block_on(MyFuture::new());
     }
 }
