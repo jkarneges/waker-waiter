@@ -112,7 +112,9 @@
 //!             return;
 //!         }
 //!
-//!         if let Some(waiter) = &*self.waiter.lock().unwrap() {
+//!         let waiter = self.waiter.lock().unwrap().clone();
+//!
+//!         if let Some(waiter) = waiter {
 //!             // if a waiter was configured, then the execution thread
 //!             // will be blocking on it and we'll need to unblock it
 //!             waiter.cancel();
@@ -163,9 +165,11 @@
 //!     match fut.as_mut().poll(&mut cx) {
 //!         Poll::Ready(res) => break res,
 //!         Poll::Pending => {
+//!             let waiter = poller.waiter.lock().unwrap().clone();
+//!
 //!             // if a waiter is configured then block on it. else do a
 //!             // standard thread park
-//!             match &*poller.waiter.lock().unwrap() {
+//!             match waiter {
 //!                 Some(waiter) => waiter.wait(),
 //!                 None => thread::park(),
 //!             }
@@ -268,7 +272,9 @@ mod executor {
                 return;
             }
 
-            if let Some(waiter) = &*self.waiter.lock().unwrap() {
+            let waiter = self.waiter.lock().unwrap().clone();
+
+            if let Some(waiter) = waiter {
                 // if a waiter was configured, then the execution thread
                 // will be blocking on it and we'll need to unblock it
                 waiter.cancel();
@@ -324,9 +330,11 @@ mod executor {
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(res) => break res,
                 Poll::Pending => {
+                    let waiter = poller.waiter.lock().unwrap().clone();
+
                     // if a waiter is configured then block on it. else do a
                     // standard thread park
-                    match &*poller.waiter.lock().unwrap() {
+                    match waiter {
                         Some(waiter) => waiter.wait(),
                         None => thread::park(),
                     }
