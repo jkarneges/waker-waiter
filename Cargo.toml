@@ -1,6 +1,6 @@
 [package]
 name = "waker-waiter"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Justin Karneges <justin@karneges.com>"]
 license = "MIT"
 description = "Helps async runtimes interoperate with arbitrary futures"
