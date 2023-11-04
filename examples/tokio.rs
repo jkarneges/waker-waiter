@@ -5,7 +5,7 @@ mod tokio_integration {
     use std::sync::{Arc, Mutex, Weak};
     use std::task::{Context, Poll, Waker};
     use tokio::runtime;
-    use waker_waiter::{with_top_level_poller, WakerWait, WakerWaiter};
+    use waker_waiter::{ContextExt, WakerWait, WakerWaiter};
 
     static WAITER_MANAGER: Mutex<Option<Arc<WaiterManager>>> = Mutex::new(None);
 
@@ -140,9 +140,13 @@ mod tokio_integration {
         }
     }
 
-    fn ensure_registered() {
-        with_top_level_poller(|p| {
-            let p = match p {
+    struct EnsureRegistered;
+
+    impl Future for EnsureRegistered {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+            let p = match cx.top_level_poller() {
                 Some(p) => p,
                 None => panic!("Thread does not provide TopLevelPoller"),
             };
@@ -150,14 +154,16 @@ mod tokio_integration {
             if p.set_waiter(WaiterManager::current().waiter()).is_err() {
                 panic!("Incompatible waiter already assigned to TopLevelPoller");
             }
-        });
+
+            Poll::Ready(())
+        }
     }
 
     pub struct TcpListener(tokio::net::TcpListener);
 
     impl TcpListener {
         pub async fn bind<A: tokio::net::ToSocketAddrs>(addr: A) -> Result<Self, io::Error> {
-            ensure_registered();
+            EnsureRegistered.await;
 
             let l = {
                 // associate object with our tokio runtime, even though the
@@ -176,7 +182,7 @@ mod tokio_integration {
         pub async fn accept(
             &self,
         ) -> Result<(tokio::net::TcpStream, std::net::SocketAddr), io::Error> {
-            ensure_registered();
+            EnsureRegistered.await;
 
             let s = {
                 // associate object with our tokio runtime, even though the
@@ -195,7 +201,7 @@ mod tokio_integration {
         pub async fn connect<A: tokio::net::ToSocketAddrs>(
             addr: A,
         ) -> Result<tokio::net::TcpStream, io::Error> {
-            ensure_registered();
+            EnsureRegistered.await;
 
             let s = {
                 // associate object with our tokio runtime, even though the

@@ -178,10 +178,14 @@
 //! }
 //! ```
 
+#![feature(waker_getters)]
+
 use std::cell::RefCell;
 use std::fmt;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 use std::sync::Arc;
+use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
 pub trait WakerWait: Send + Sync {
     fn wait(self: Arc<Self>);
@@ -250,9 +254,113 @@ where
     })
 }
 
+struct WakerWithTopLevelPoller<'a> {
+    inner: Waker,
+    poller: &'a mut dyn TopLevelPoller,
+}
+
+unsafe fn clone_fn(data: *const ()) -> RawWaker {
+    let w = (data as *const WakerWithTopLevelPoller).as_ref().unwrap();
+
+    let inner = ManuallyDrop::new(w.inner.clone());
+    let inner_raw = inner.as_raw();
+
+    RawWaker::new(inner_raw.data(), inner_raw.vtable())
+}
+
+unsafe fn wake_fn(data: *const ()) {
+    let data = data as *mut WakerWithTopLevelPoller;
+    let w = Box::from_raw(data);
+
+    w.inner.wake();
+}
+
+unsafe fn wake_by_ref_fn(data: *const ()) {
+    let w = (data as *const WakerWithTopLevelPoller).as_ref().unwrap();
+
+    w.inner.wake_by_ref();
+}
+
+unsafe fn drop_fn(data: *const ()) {
+    let data = data as *mut WakerWithTopLevelPoller;
+    drop(Box::from_raw(data));
+}
+
+const VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
+
+impl<'a> WakerWithTopLevelPoller<'a> {
+    fn new(waker: Waker, poller: &'a mut dyn TopLevelPoller) -> Self {
+        Self {
+            inner: waker,
+            poller,
+        }
+    }
+
+    // caller must ensure poller outlives returned Waker
+    unsafe fn into_std(self) -> Waker {
+        let data = Box::new(self);
+        let rw = RawWaker::new(Box::into_raw(data) as *const (), &VTABLE);
+
+        unsafe { Waker::from_raw(rw) }
+    }
+
+    fn try_from_raw(rw: &'a RawWaker) -> Option<&'a mut Self> {
+        if rw.vtable() == &VTABLE {
+            unsafe {
+                Some(
+                    (rw.data() as *mut WakerWithTopLevelPoller)
+                        .as_mut()
+                        .unwrap(),
+                )
+            }
+        } else {
+            None
+        }
+    }
+}
+
+pub trait ContextExt<'a> {
+    fn with_top_level_poller<'b: 'a>(
+        self,
+        poller: &'b mut dyn TopLevelPoller,
+        scratch: &'a mut MaybeUninit<Waker>,
+    ) -> Self;
+    fn top_level_poller(&mut self) -> Option<&mut dyn TopLevelPoller>;
+}
+
+impl<'a> ContextExt<'a> for Context<'a> {
+    fn with_top_level_poller<'b: 'a>(
+        self,
+        poller: &'b mut dyn TopLevelPoller,
+        scratch: &'a mut MaybeUninit<Waker>,
+    ) -> Self {
+        let waker = WakerWithTopLevelPoller::new(self.waker().clone(), poller);
+
+        // SAFETY: poller outlives waker
+        let waker = unsafe { waker.into_std() };
+
+        scratch.write(waker);
+
+        // SAFETY: data is initialized
+        let waker = unsafe { scratch.assume_init_ref() };
+
+        Self::from_waker(waker)
+    }
+
+    fn top_level_poller(&mut self) -> Option<&mut dyn TopLevelPoller> {
+        let rw = self.waker().as_raw();
+
+        match WakerWithTopLevelPoller::try_from_raw(rw) {
+            Some(w) => Some(w.poller),
+            None => None,
+        }
+    }
+}
+
 mod executor {
-    use super::{set_top_level_poller, SetWaiterError, TopLevelPoller, WakerWaiter};
+    use super::{set_top_level_poller, ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter};
     use std::future::Future;
+    use std::mem::MaybeUninit;
     use std::pin::pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake};
@@ -314,20 +422,30 @@ mod executor {
         T: Future,
     {
         let waiter = Arc::new(Mutex::new(None));
+        let mut poller = MyTopLevelPoller {
+            waiter: Arc::clone(&waiter),
+        };
+
         let waker = Arc::new(ThreadWaker {
             thread: thread::current(),
-            waiter: Arc::clone(&waiter),
+            waiter,
         })
         .into();
-        let mut cx = Context::from_waker(&waker);
-        let poller = MyTopLevelPoller { waiter };
 
         set_top_level_poller(Some(poller.clone()));
 
         let mut fut = pin!(fut);
 
         let res = loop {
-            match fut.as_mut().poll(&mut cx) {
+            let result = {
+                let mut scratch = MaybeUninit::uninit();
+                let mut cx =
+                    Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
+
+                fut.as_mut().poll(&mut cx)
+            };
+
+            match result {
                 Poll::Ready(res) => break res,
                 Poll::Pending => {
                     let waiter = poller.waiter.lock().unwrap().clone();
