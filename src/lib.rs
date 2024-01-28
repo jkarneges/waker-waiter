@@ -1,10 +1,10 @@
-//! This library helps async runtimes support the execution of arbitrary futures, by enabling futures to provide their own event polling logic. It is an attempt to implement the approach described by [Context reactor hook](https://jblog.andbit.net/2022/12/28/context-reactor-hook/), except using thread locals instead of modifying [`std::task::Context`]. The hook essentially provides a thread-level effect, so having to resort to thread locals here is not limiting.
+//! This library helps async runtimes support the execution of arbitrary futures, by enabling futures to provide their own event polling logic. It is an attempt to implement the approach described by [Context reactor hook](https://jblog.andbit.net/2022/12/28/context-reactor-hook/).
 //!
 //! There are two integration points:
-//! - Futures that need to run their own event polling logic in the execution thread must call [`with_top_level_poller`] and then [`TopLevelPoller::set_waiter`] to register a [`WakerWaiter`].
-//! - Whatever part of the application is responsible for polling top-level futures (i.e. the async runtime) needs to implement the [`TopLevelPoller`] trait and call [`set_top_level_poller`] to make it discoverable. This library provides such an implementation via [`block_on`].
+//! - Futures that need to run their own event polling logic in the execution thread must call [`ContextExt::top_level_poller`] to obtain a [`TopLevelPoller`] and then call [`TopLevelPoller::set_waiter`] to register a [`WakerWaiter`] on it.
+//! - Whatever part of the application that is responsible for polling top-level futures (i.e. the async runtime) needs to implement the [`TopLevelPoller`] trait and provide it using [`ContextExt::with_top_level_poller`]. This library provides such an implementation via [`block_on`].
 //!
-//! Only one [`WakerWaiter`] can be registerd on a [`TopLevelPoller`]. If more than one future relies on the same event polling logic, the futures should coordinate and share the same [`WakerWaiter`].
+//! Only one [`WakerWaiter`] can be registered on a [`TopLevelPoller`]. If more than one future relies on the same event polling logic, the futures should coordinate and share the same [`WakerWaiter`].
 //!
 //!
 //! # Example of a future registering a `WakerWaiter`
@@ -14,7 +14,7 @@
 //! # use std::pin::Pin;
 //! # use std::sync::{Arc, Mutex, Weak};
 //! # use std::task::{Context, Poll};
-//! # use waker_waiter::{WakerWait, WakerWaiter};
+//! # use waker_waiter::{ContextExt, WakerWait, WakerWaiter};
 //! #
 //! static REACTOR: Mutex<Option<Arc<Reactor>>> = Mutex::new(None);
 //!
@@ -71,17 +71,15 @@
 //! impl Future for MyFuture {
 //! #   type Output = ();
 //! #
-//!     fn poll(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
-//!         waker_waiter::with_top_level_poller(|p| {
-//!             let p = match p {
-//!                 Some(p) => p,
-//!                 None => panic!("MyFuture requires thread to provide TopLevelPoller"),
-//!             };
+//!     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+//!         let p = match cx.top_level_poller() {
+//!             Some(p) => p,
+//!             None => panic!("MyFuture requires context to provide TopLevelPoller"),
+//!         };
 //!
-//!             if p.set_waiter(Reactor::current().waiter()).is_err() {
-//!                 panic!("Incompatible waiter already assigned to TopLevelPoller");
-//!             }
-//!         });
+//!         if p.set_waiter(Reactor::current().waiter()).is_err() {
+//!             panic!("Incompatible waiter already assigned to TopLevelPoller");
+//!         }
 //!
 //!         // ... register waker, perform I/O, etc ...
 //! #       unimplemented!();
@@ -93,11 +91,12 @@
 //!
 //! ```
 //! # use std::future::Future;
+//! # use std::mem::MaybeUninit;
 //! # use std::pin::{pin, Pin};
 //! # use std::sync::{Arc, Mutex};
 //! # use std::task::{Context, Poll, Wake};
 //! # use std::thread::{self, Thread};
-//! # use waker_waiter::{SetWaiterError, TopLevelPoller, WakerWaiter};
+//! # use waker_waiter::{ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter};
 //! struct ThreadWaker {
 //!     thread: Thread,
 //!     waiter: Arc<Mutex<Option<WakerWaiter>>>,
@@ -155,14 +154,20 @@
 //!     waiter: Arc::clone(&waiter),
 //! }).into();
 //! let mut cx = Context::from_waker(&waker);
-//! let poller = MyTopLevelPoller { waiter };
-//!
-//! waker_waiter::set_top_level_poller(Some(poller.clone()));
+//! let mut poller = MyTopLevelPoller { waiter };
 //!
 //! let mut fut = pin!(async { /* ... */ });
 //!
 //! loop {
-//!     match fut.as_mut().poll(&mut cx) {
+//!    let result = {
+//!        let mut scratch = MaybeUninit::uninit();
+//!        let mut cx =
+//!            Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
+//!
+//!        fut.as_mut().poll(&mut cx)
+//!    };
+//!
+//!    match result {
 //!         Poll::Ready(res) => break res,
 //!         Poll::Pending => {
 //!             let waiter = poller.waiter.lock().unwrap().clone();
@@ -180,7 +185,6 @@
 
 #![feature(waker_getters)]
 
-use std::cell::RefCell;
 use std::fmt;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
@@ -229,29 +233,6 @@ impl fmt::Display for SetWaiterError {
 
 pub trait TopLevelPoller {
     fn set_waiter(&mut self, waiter: &WakerWaiter) -> Result<(), SetWaiterError>;
-}
-
-thread_local! {
-    static POLLER: RefCell<Option<Box<dyn TopLevelPoller>>> = RefCell::new(None);
-}
-
-pub fn set_top_level_poller<T: TopLevelPoller + 'static>(t: Option<T>) {
-    POLLER.with(|r| {
-        r.replace(match t {
-            Some(t) => Some(Box::new(t)),
-            None => None,
-        })
-    });
-}
-
-pub fn with_top_level_poller<F>(f: F)
-where
-    F: FnOnce(Option<&mut dyn TopLevelPoller>),
-{
-    POLLER.with(|r| match &mut *r.borrow_mut() {
-        Some(t) => f(Some(Box::as_mut(t))),
-        None => f(None),
-    })
 }
 
 struct WakerWithTopLevelPoller<'a> {
@@ -326,6 +307,7 @@ pub trait ContextExt<'a> {
         scratch: &'a mut MaybeUninit<Waker>,
     ) -> Self;
     fn top_level_poller(&mut self) -> Option<&mut dyn TopLevelPoller>;
+    fn with_waker<'b>(&'b mut self, waker: &'b Waker) -> Context<'b>;
 }
 
 impl<'a> ContextExt<'a> for Context<'a> {
@@ -355,10 +337,21 @@ impl<'a> ContextExt<'a> for Context<'a> {
             None => None,
         }
     }
+
+    fn with_waker<'b>(&'b mut self, waker: &'b Waker) -> Context<'b> {
+        match WakerWithTopLevelPoller::try_from_raw(self.waker().as_raw()) {
+            Some(w) => {
+                w.inner = waker.clone();
+
+                Context::from_waker(self.waker())
+            }
+            None => Context::from_waker(waker),
+        }
+    }
 }
 
 mod executor {
-    use super::{set_top_level_poller, ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter};
+    use super::{ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter};
     use std::future::Future;
     use std::mem::MaybeUninit;
     use std::pin::pin;
@@ -432,8 +425,6 @@ mod executor {
         })
         .into();
 
-        set_top_level_poller(Some(poller.clone()));
-
         let mut fut = pin!(fut);
 
         let res = loop {
@@ -460,8 +451,6 @@ mod executor {
             }
         };
 
-        set_top_level_poller::<MyTopLevelPoller>(None);
-
         res
     }
 }
@@ -471,9 +460,9 @@ pub use executor::block_on;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::future::Future;
     use std::pin::{pin, Pin};
-    use std::rc::Rc;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake};
 
@@ -487,7 +476,7 @@ mod tests {
         waiter: RefCell<Option<WakerWaiter>>,
     }
 
-    impl TopLevelPoller for Rc<MyTopLevelPoller> {
+    impl TopLevelPoller for MyTopLevelPoller {
         fn set_waiter(&mut self, waiter: &WakerWaiter) -> Result<(), SetWaiterError> {
             let self_waiter = &mut *self.waiter.borrow_mut();
 
@@ -527,46 +516,74 @@ mod tests {
     impl Future for MyFuture {
         type Output = ();
 
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
             // first, apply WakerWaiter
             // NOTE: alternatively, the lookup/set could happen when MyFuture
             // is constructed (or when some parent owner is constructed)
 
+            let waker = Arc::new(NoopWaker).into();
+            let mut cx1 = cx.with_waker(&waker);
+
             // should be cheap: looking up a thread local
             // NOTE: later on, this could become a property of Context
-            with_top_level_poller(|p| {
-                match p {
-                    Some(p) => {
-                        // can be cheap: it's up to the setter impl, but this
-                        // could just be a pointer comparison
-                        if p.set_waiter(&self.waiter).is_err() {
-                            panic!("Incompatible WakerWaiter already assigned to thread's TopLevelPoller");
-                        }
-                    }
-                    None => panic!("MyFuture requires thread to provide TopLevelPoller"),
-                }
-            });
+            let p = match cx1.top_level_poller() {
+                Some(p) => p,
+                None => panic!("MyFuture requires context to provide TopLevelPoller"),
+            };
+
+            // can be cheap: it's up to the setter impl, but this
+            // could just be a pointer comparison
+            if p.set_waiter(&self.waiter).is_err() {
+                panic!("Incompatible WakerWaiter already assigned to context's TopLevelPoller");
+            }
 
             Poll::Ready(())
         }
     }
 
     #[test]
+    fn test_context_inherit() {
+        let waker = Arc::new(NoopWaker).into();
+
+        let mut poller = MyTopLevelPoller {
+            waiter: RefCell::new(None),
+        };
+
+        let mut scratch = MaybeUninit::uninit();
+        let mut cx = Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
+
+        assert!(cx.top_level_poller().is_some());
+
+        {
+            let waker = Arc::new(NoopWaker).into();
+            let mut cx2 = cx.with_waker(&waker);
+
+            assert!(cx2.top_level_poller().is_some());
+        }
+
+        assert!(cx.top_level_poller().is_some());
+    }
+
+    #[test]
     fn test_waiter() {
         let waker = Arc::new(NoopWaker).into();
-        let poller = Rc::new(MyTopLevelPoller {
+
+        let mut poller = MyTopLevelPoller {
             waiter: RefCell::new(None),
-        });
-
-        let mut cx = Context::from_waker(&waker);
-
-        // NOTE: later on, this could become a property of Context
-        set_top_level_poller(Some(Rc::clone(&poller)));
+        };
 
         let mut fut = pin!(MyFuture::new());
 
         loop {
-            match fut.as_mut().poll(&mut cx) {
+            let result = {
+                let mut scratch = MaybeUninit::uninit();
+                let mut cx =
+                    Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
+
+                fut.as_mut().poll(&mut cx)
+            };
+
+            match result {
                 Poll::Ready(res) => break res,
                 Poll::Pending => match &*poller.waiter.borrow() {
                     Some(waiter) => Arc::clone(&waiter.0).wait(),
