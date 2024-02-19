@@ -43,7 +43,7 @@ mod tokio_integration {
                     .unwrap();
 
                 *manager = Some(Arc::new_cyclic(|m| {
-                    let waiter = WakerWaiter::new(Arc::new(Waiter(m.clone())));
+                    let waiter = Arc::new(Waiter(m.clone())).into();
 
                     Self {
                         runtime,
@@ -78,7 +78,7 @@ mod tokio_integration {
     struct Waiter(Weak<WaiterManager>);
 
     impl WakerWait for Waiter {
-        fn wait(self: Arc<Self>) {
+        fn wait(self: &Arc<Self>) {
             println!("wait start");
 
             let manager = self.0.upgrade().unwrap();
@@ -93,11 +93,15 @@ mod tokio_integration {
             println!("wait end");
         }
 
-        fn cancel(self: Arc<Self>) {
+        fn cancel(self: &Arc<Self>) {
             if let Some(manager) = self.0.upgrade() {
                 // tell PendingOnce to complete
                 manager.wake();
             }
+        }
+
+        fn can_cancel(self: &Arc<Self>) -> bool {
+            true
         }
     }
 

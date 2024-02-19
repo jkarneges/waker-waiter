@@ -29,9 +29,9 @@
 //!         if reactor.is_none() {
 //!             let r = Arc::new(Reactor { waiter: None });
 //!
-//!             let waiter = WakerWaiter::new(Arc::new(ReactorWaiter {
+//!             let waiter = Arc::new(ReactorWaiter {
 //!                 reactor: Arc::downgrade(&r),
-//!             }));
+//!             }).into();
 //!
 //!             // SAFETY: nobody else could be borrowing right now
 //!             let r = unsafe {
@@ -57,12 +57,16 @@
 //! }
 //!
 //! impl WakerWait for ReactorWaiter {
-//!     fn wait(self: Arc<Self>) {
+//!     fn wait(self: &Arc<Self>) {
 //!         // ... blocking poll for events ...
 //!     }
 //!
-//!     fn cancel(self: Arc<Self>) {
+//!     fn cancel(self: &Arc<Self>) {
 //!         // ... some way to unblock the above ...
+//!     }
+//!
+//!     fn can_cancel(self: &Arc<Self>) -> bool {
+//!         true
 //!     }
 //! }
 //!
@@ -186,40 +190,186 @@
 #![feature(waker_getters)]
 
 use std::fmt;
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::ptr;
+use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::sync::Arc;
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
-pub trait WakerWait: Send + Sync {
-    fn wait(self: Arc<Self>);
-    fn cancel(self: Arc<Self>);
+#[derive(PartialEq)]
+pub struct RawWaiterVTable {
+    clone: unsafe fn(*const ()) -> RawWaiter,
+    wait: unsafe fn(*const ()),
+    cancel: unsafe fn(*const ()),
+    can_cancel: unsafe fn(*const ()) -> bool,
+    drop: unsafe fn(*const ()),
 }
 
-#[derive(Clone)]
-pub struct WakerWaiter(Arc<dyn WakerWait>);
+impl RawWaiterVTable {
+    pub const fn new(
+        clone: unsafe fn(_: *const ()) -> RawWaiter,
+        wait: unsafe fn(_: *const ()),
+        cancel: unsafe fn(_: *const ()),
+        can_cancel: unsafe fn(_: *const ()) -> bool,
+        drop: unsafe fn(_: *const ()),
+    ) -> Self {
+        Self {
+            clone,
+            wait,
+            cancel,
+            can_cancel,
+            drop,
+        }
+    }
+}
+
+#[derive(PartialEq)]
+pub struct RawWaiter {
+    data: *const (),
+    vtable: &'static RawWaiterVTable,
+}
+
+impl RawWaiter {
+    #[inline]
+    pub const fn new(data: *const (), vtable: &'static RawWaiterVTable) -> Self {
+        Self { data, vtable }
+    }
+}
+
+#[derive(PartialEq)]
+pub struct WakerWaiter {
+    inner: RawWaiter,
+}
 
 impl WakerWaiter {
-    pub fn new(wait: Arc<dyn WakerWait>) -> Self {
-        Self(wait)
-    }
-
     pub fn wait(&self) {
-        Arc::clone(&self.0).wait();
+        unsafe { (self.inner.vtable.wait)(self.inner.data) }
     }
 
     pub fn cancel(&self) {
-        Arc::clone(&self.0).cancel();
+        unsafe { (self.inner.vtable.cancel)(self.inner.data) }
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        unsafe { (self.inner.vtable.can_cancel)(self.inner.data) }
+    }
+
+    pub fn to_local(self) -> LocalWakerWaiter {
+        let data = self.inner.data;
+        let vtable = self.inner.vtable;
+
+        mem::forget(self);
+
+        LocalWakerWaiter {
+            inner: RawWaiter { data, vtable },
+        }
     }
 }
 
-impl PartialEq for WakerWaiter {
-    fn eq(&self, other: &Self) -> bool {
-        let a = Arc::as_ptr(&self.0) as *const ();
-        let b = Arc::as_ptr(&other.0) as *const ();
-
-        ptr::eq(a, b)
+impl Clone for WakerWaiter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: unsafe { (self.inner.vtable.clone)(self.inner.data) },
+        }
     }
+}
+
+impl Drop for WakerWaiter {
+    fn drop(&mut self) {
+        unsafe { (self.inner.vtable.drop)(self.inner.data) }
+    }
+}
+
+unsafe impl Send for WakerWaiter {}
+unsafe impl Sync for WakerWaiter {}
+
+#[derive(PartialEq)]
+pub struct LocalWakerWaiter {
+    inner: RawWaiter,
+}
+
+impl LocalWakerWaiter {
+    pub fn wait(&self) {
+        unsafe { (self.inner.vtable.wait)(self.inner.data) }
+    }
+
+    pub fn cancel(&self) {
+        unsafe { (self.inner.vtable.cancel)(self.inner.data) }
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        unsafe { (self.inner.vtable.can_cancel)(self.inner.data) }
+    }
+}
+
+impl Clone for LocalWakerWaiter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: unsafe { (self.inner.vtable.clone)(self.inner.data) },
+        }
+    }
+}
+
+impl Drop for LocalWakerWaiter {
+    fn drop(&mut self) {
+        unsafe { (self.inner.vtable.drop)(self.inner.data) }
+    }
+}
+
+pub trait WakerWait {
+    fn wait(self: &Arc<Self>);
+    fn cancel(self: &Arc<Self>);
+    fn can_cancel(self: &Arc<Self>) -> bool;
+}
+
+impl<W: WakerWait + Send + Sync + 'static> From<Arc<W>> for WakerWaiter {
+    fn from(waiter: Arc<W>) -> WakerWaiter {
+        Self {
+            inner: raw_waiter(waiter),
+        }
+    }
+}
+
+#[inline(always)]
+fn raw_waiter<W: WakerWait + Send + Sync + 'static>(waiter: Arc<W>) -> RawWaiter {
+    struct VTablePerType<W>(W);
+
+    impl<W: WakerWait + Send + Sync + 'static> VTablePerType<W> {
+        const VTABLE: &'static RawWaiterVTable = &RawWaiterVTable::new(
+            clone_waiter::<W>,
+            wait::<W>,
+            cancel::<W>,
+            can_cancel::<W>,
+            drop_waiter::<W>,
+        );
+    }
+
+    unsafe fn clone_waiter<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) -> RawWaiter {
+        unsafe { Arc::increment_strong_count(waiter as *const W) };
+        RawWaiter::new(waiter as *const (), VTablePerType::<W>::VTABLE)
+    }
+
+    unsafe fn wait<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) {
+        let waiter = unsafe { ManuallyDrop::new(Arc::from_raw(waiter as *const W)) };
+        <W as WakerWait>::wait(&waiter);
+    }
+
+    unsafe fn cancel<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) {
+        let waiter = unsafe { ManuallyDrop::new(Arc::from_raw(waiter as *const W)) };
+        <W as WakerWait>::cancel(&waiter);
+    }
+
+    unsafe fn can_cancel<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) -> bool {
+        let waiter = unsafe { ManuallyDrop::new(Arc::from_raw(waiter as *const W)) };
+        <W as WakerWait>::can_cancel(&waiter)
+    }
+
+    unsafe fn drop_waiter<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) {
+        unsafe { Arc::decrement_strong_count(waiter as *const W) };
+    }
+
+    RawWaiter::new(
+        Arc::into_raw(waiter) as *const (),
+        VTablePerType::<W>::VTABLE,
+    )
 }
 
 #[derive(Debug)]
@@ -227,12 +377,31 @@ pub struct SetWaiterError;
 
 impl fmt::Display for SetWaiterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Failed to set waiter")
+        write!(f, "Failed to set waiter: conflict")
+    }
+}
+
+#[derive(Debug)]
+pub enum SetLocalWaiterError {
+    Conflict,
+    Unsupported,
+}
+
+impl fmt::Display for SetLocalWaiterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict => write!(f, "Failed to set local waiter: conflict"),
+            Self::Unsupported => write!(f, "Failed to set local waiter: unsupported"),
+        }
     }
 }
 
 pub trait TopLevelPoller {
     fn set_waiter(&mut self, waiter: &WakerWaiter) -> Result<(), SetWaiterError>;
+
+    fn set_local_waiter(&mut self, _waiter: &LocalWakerWaiter) -> Result<(), SetLocalWaiterError> {
+        Err(SetLocalWaiterError::Unsupported)
+    }
 }
 
 struct WakerWithTopLevelPoller<'a> {
@@ -307,7 +476,11 @@ pub trait ContextExt<'a> {
         scratch: &'a mut MaybeUninit<Waker>,
     ) -> Self;
     fn top_level_poller(&mut self) -> Option<&mut dyn TopLevelPoller>;
-    fn with_waker<'b>(&'b mut self, waker: &'b Waker) -> Context<'b>;
+    fn with_waker<'b>(
+        &'b mut self,
+        waker: &'b Waker,
+        scratch: &'b mut MaybeUninit<Waker>,
+    ) -> Context<'b>;
 }
 
 impl<'a> ContextExt<'a> for Context<'a> {
@@ -330,22 +503,45 @@ impl<'a> ContextExt<'a> for Context<'a> {
     }
 
     fn top_level_poller(&mut self) -> Option<&mut dyn TopLevelPoller> {
-        let rw = self.waker().as_raw();
-
-        match WakerWithTopLevelPoller::try_from_raw(rw) {
+        match WakerWithTopLevelPoller::try_from_raw(self.waker().as_raw()) {
             Some(w) => Some(w.poller),
             None => None,
         }
     }
 
-    fn with_waker<'b>(&'b mut self, waker: &'b Waker) -> Context<'b> {
+    fn with_waker<'b>(
+        &'b mut self,
+        waker: &'b Waker,
+        scratch: &'b mut MaybeUninit<Waker>,
+    ) -> Context<'b> {
         match WakerWithTopLevelPoller::try_from_raw(self.waker().as_raw()) {
             Some(w) => {
-                w.inner = waker.clone();
+                let waker = WakerWithTopLevelPoller::new(waker.clone(), w.poller);
 
-                Context::from_waker(self.waker())
+                // SAFETY: poller outlives waker
+                let waker = unsafe { waker.into_std() };
+
+                scratch.write(waker);
+
+                // SAFETY: data is initialized
+                let waker = unsafe { scratch.assume_init_ref() };
+
+                Context::from_waker(waker)
             }
             None => Context::from_waker(waker),
+        }
+    }
+}
+
+pub trait WakerExt {
+    fn will_wake2(&self, other: &Waker) -> bool;
+}
+
+impl WakerExt for Waker {
+    fn will_wake2(&self, other: &Waker) -> bool {
+        match WakerWithTopLevelPoller::try_from_raw(self.as_raw()) {
+            Some(w) => w.inner.will_wake(other),
+            None => self.will_wake(other),
         }
     }
 }
@@ -497,8 +693,11 @@ mod tests {
     struct NoopWakerWaiter;
 
     impl WakerWait for NoopWakerWaiter {
-        fn wait(self: Arc<Self>) {}
-        fn cancel(self: Arc<Self>) {}
+        fn wait(self: &Arc<Self>) {}
+        fn cancel(self: &Arc<Self>) {}
+        fn can_cancel(self: &Arc<Self>) -> bool {
+            false
+        }
     }
 
     struct MyFuture {
@@ -508,7 +707,7 @@ mod tests {
     impl MyFuture {
         fn new() -> Self {
             Self {
-                waiter: WakerWaiter::new(Arc::new(NoopWakerWaiter)),
+                waiter: Arc::new(NoopWakerWaiter).into(),
             }
         }
     }
@@ -522,7 +721,8 @@ mod tests {
             // is constructed (or when some parent owner is constructed)
 
             let waker = Arc::new(NoopWaker).into();
-            let mut cx1 = cx.with_waker(&waker);
+            let mut scratch = MaybeUninit::uninit();
+            let mut cx1 = cx.with_waker(&waker, &mut scratch);
 
             // should be cheap: looking up a thread local
             // NOTE: later on, this could become a property of Context
@@ -552,15 +752,19 @@ mod tests {
         let mut scratch = MaybeUninit::uninit();
         let mut cx = Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
 
+        assert!(cx.waker().will_wake2(&waker));
         assert!(cx.top_level_poller().is_some());
 
         {
             let waker = Arc::new(NoopWaker).into();
-            let mut cx2 = cx.with_waker(&waker);
+            let mut scratch = MaybeUninit::uninit();
+            let mut cx2 = cx.with_waker(&waker, &mut scratch);
 
+            assert!(cx2.waker().will_wake2(&waker));
             assert!(cx2.top_level_poller().is_some());
         }
 
+        assert!(cx.waker().will_wake2(&waker));
         assert!(cx.top_level_poller().is_some());
     }
 
@@ -586,7 +790,7 @@ mod tests {
             match result {
                 Poll::Ready(res) => break res,
                 Poll::Pending => match &*poller.waiter.borrow() {
-                    Some(waiter) => Arc::clone(&waiter.0).wait(),
+                    Some(waiter) => waiter.wait(),
                     None => {}
                 },
             }
