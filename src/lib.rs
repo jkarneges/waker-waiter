@@ -14,7 +14,7 @@
 //! # use std::pin::Pin;
 //! # use std::sync::{Arc, Mutex, Weak};
 //! # use std::task::{Context, Poll};
-//! # use waker_waiter::{ContextExt, WakerWait, WakerWaiter};
+//! # use waker_waiter::{ContextExt, WakerWait, WakerWaiter, WakerWaiterCanceler};
 //! #
 //! static REACTOR: Mutex<Option<Arc<Reactor>>> = Mutex::new(None);
 //!
@@ -59,14 +59,12 @@
 //! impl WakerWait for ReactorWaiter {
 //!     fn wait(self: &Arc<Self>) {
 //!         // ... blocking poll for events ...
+//!         todo!();
 //!     }
 //!
-//!     fn cancel(self: &Arc<Self>) {
-//!         // ... some way to unblock the above ...
-//!     }
-//!
-//!     fn can_cancel(self: &Arc<Self>) -> bool {
-//!         true
+//!     fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler> {
+//!         // ... provide a way to unblock the above ...
+//!         todo!();
 //!     }
 //! }
 //!
@@ -120,7 +118,7 @@
 //!         if let Some(waiter) = waiter {
 //!             // if a waiter was configured, then the execution thread
 //!             // will be blocking on it and we'll need to unblock it
-//!             waiter.cancel();
+//!             waiter.canceler().unwrap().cancel();
 //!         } else {
 //!             // if a waiter was not configured, then the execution
 //!             // thread will be asleep with a standard thread park
@@ -191,15 +189,81 @@
 
 use std::fmt;
 use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::ptr;
 use std::sync::Arc;
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+pub struct RawCancelerVTable {
+    clone: unsafe fn(*const ()) -> RawCanceler,
+    cancel: unsafe fn(*const ()),
+    drop: unsafe fn(*const ()),
+}
+
+impl RawCancelerVTable {
+    pub const fn new(
+        clone: unsafe fn(_: *const ()) -> RawCanceler,
+        cancel: unsafe fn(_: *const ()),
+        drop: unsafe fn(_: *const ()),
+    ) -> Self {
+        Self {
+            clone,
+            cancel,
+            drop,
+        }
+    }
+}
+
+pub struct RawCanceler {
+    data: *const (),
+    vtable: &'static RawCancelerVTable,
+}
+
+impl RawCanceler {
+    #[inline]
+    pub const fn new(data: *const (), vtable: &'static RawCancelerVTable) -> Self {
+        Self { data, vtable }
+    }
+}
+
+pub struct WakerWaiterCanceler {
+    inner: RawCanceler,
+}
+
+impl WakerWaiterCanceler {
+    pub fn cancel(&self) {
+        unsafe { (self.inner.vtable.cancel)(self.inner.data) }
+    }
+
+    fn into_raw(mut self) -> RawCanceler {
+        const NOOP_VTABLE: &'static RawCancelerVTable =
+            &RawCancelerVTable::new(|c| RawCanceler::new(c, NOOP_VTABLE), |_| {}, |_| {});
+
+        mem::replace(&mut self.inner, RawCanceler::new(ptr::null(), NOOP_VTABLE))
+    }
+}
+
+impl Clone for WakerWaiterCanceler {
+    fn clone(&self) -> Self {
+        Self {
+            inner: unsafe { (self.inner.vtable.clone)(self.inner.data) },
+        }
+    }
+}
+
+impl Drop for WakerWaiterCanceler {
+    fn drop(&mut self) {
+        unsafe { (self.inner.vtable.drop)(self.inner.data) }
+    }
+}
+
+unsafe impl Send for WakerWaiterCanceler {}
+unsafe impl Sync for WakerWaiterCanceler {}
 
 #[derive(PartialEq)]
 pub struct RawWaiterVTable {
     clone: unsafe fn(*const ()) -> RawWaiter,
     wait: unsafe fn(*const ()),
-    cancel: unsafe fn(*const ()),
-    can_cancel: unsafe fn(*const ()) -> bool,
+    canceler: unsafe fn(*const ()) -> Option<RawCanceler>,
     drop: unsafe fn(*const ()),
 }
 
@@ -207,15 +271,13 @@ impl RawWaiterVTable {
     pub const fn new(
         clone: unsafe fn(_: *const ()) -> RawWaiter,
         wait: unsafe fn(_: *const ()),
-        cancel: unsafe fn(_: *const ()),
-        can_cancel: unsafe fn(_: *const ()) -> bool,
+        canceler: unsafe fn(_: *const ()) -> Option<RawCanceler>,
         drop: unsafe fn(_: *const ()),
     ) -> Self {
         Self {
             clone,
             wait,
-            cancel,
-            can_cancel,
+            canceler,
             drop,
         }
     }
@@ -244,12 +306,10 @@ impl WakerWaiter {
         unsafe { (self.inner.vtable.wait)(self.inner.data) }
     }
 
-    pub fn cancel(&self) {
-        unsafe { (self.inner.vtable.cancel)(self.inner.data) }
-    }
+    pub fn canceler(&self) -> Option<WakerWaiterCanceler> {
+        let raw = unsafe { (self.inner.vtable.canceler)(self.inner.data) };
 
-    pub fn can_cancel(&self) -> bool {
-        unsafe { (self.inner.vtable.can_cancel)(self.inner.data) }
+        raw.map(|v| WakerWaiterCanceler { inner: v })
     }
 
     pub fn to_local(self) -> LocalWakerWaiter {
@@ -291,12 +351,10 @@ impl LocalWakerWaiter {
         unsafe { (self.inner.vtable.wait)(self.inner.data) }
     }
 
-    pub fn cancel(&self) {
-        unsafe { (self.inner.vtable.cancel)(self.inner.data) }
-    }
+    pub fn canceler(&self) -> Option<WakerWaiterCanceler> {
+        let raw = unsafe { (self.inner.vtable.canceler)(self.inner.data) };
 
-    pub fn can_cancel(&self) -> bool {
-        unsafe { (self.inner.vtable.can_cancel)(self.inner.data) }
+        raw.map(|v| WakerWaiterCanceler { inner: v })
     }
 }
 
@@ -316,12 +374,11 @@ impl Drop for LocalWakerWaiter {
 
 pub trait WakerWait {
     fn wait(self: &Arc<Self>);
-    fn cancel(self: &Arc<Self>);
-    fn can_cancel(self: &Arc<Self>) -> bool;
+    fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler>;
 }
 
 impl<W: WakerWait + Send + Sync + 'static> From<Arc<W>> for WakerWaiter {
-    fn from(waiter: Arc<W>) -> WakerWaiter {
+    fn from(waiter: Arc<W>) -> Self {
         Self {
             inner: raw_waiter(waiter),
         }
@@ -336,14 +393,14 @@ fn raw_waiter<W: WakerWait + Send + Sync + 'static>(waiter: Arc<W>) -> RawWaiter
         const VTABLE: &'static RawWaiterVTable = &RawWaiterVTable::new(
             clone_waiter::<W>,
             wait::<W>,
-            cancel::<W>,
-            can_cancel::<W>,
+            canceler::<W>,
             drop_waiter::<W>,
         );
     }
 
     unsafe fn clone_waiter<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) -> RawWaiter {
         unsafe { Arc::increment_strong_count(waiter as *const W) };
+
         RawWaiter::new(waiter as *const (), VTablePerType::<W>::VTABLE)
     }
 
@@ -352,14 +409,13 @@ fn raw_waiter<W: WakerWait + Send + Sync + 'static>(waiter: Arc<W>) -> RawWaiter
         <W as WakerWait>::wait(&waiter);
     }
 
-    unsafe fn cancel<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) {
+    unsafe fn canceler<W: WakerWait + Send + Sync + 'static>(
+        waiter: *const (),
+    ) -> Option<RawCanceler> {
         let waiter = unsafe { ManuallyDrop::new(Arc::from_raw(waiter as *const W)) };
-        <W as WakerWait>::cancel(&waiter);
-    }
+        let canceler = <W as WakerWait>::canceler(&waiter);
 
-    unsafe fn can_cancel<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) -> bool {
-        let waiter = unsafe { ManuallyDrop::new(Arc::from_raw(waiter as *const W)) };
-        <W as WakerWait>::can_cancel(&waiter)
+        canceler.map(|v| v.into_raw())
     }
 
     unsafe fn drop_waiter<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) {
@@ -369,6 +425,50 @@ fn raw_waiter<W: WakerWait + Send + Sync + 'static>(waiter: Arc<W>) -> RawWaiter
     RawWaiter::new(
         Arc::into_raw(waiter) as *const (),
         VTablePerType::<W>::VTABLE,
+    )
+}
+
+pub trait WakerWaiterCancel {
+    fn cancel(self: &Arc<Self>);
+}
+
+impl<C: WakerWaiterCancel + Send + Sync + 'static> From<Arc<C>> for WakerWaiterCanceler {
+    fn from(canceler: Arc<C>) -> Self {
+        Self {
+            inner: raw_canceler(canceler),
+        }
+    }
+}
+
+#[inline(always)]
+fn raw_canceler<C: WakerWaiterCancel + Send + Sync + 'static>(canceler: Arc<C>) -> RawCanceler {
+    struct VTablePerType<C>(C);
+
+    impl<C: WakerWaiterCancel + Send + Sync + 'static> VTablePerType<C> {
+        const VTABLE: &'static RawCancelerVTable =
+            &RawCancelerVTable::new(clone_canceler::<C>, cancel::<C>, drop_canceler::<C>);
+    }
+
+    unsafe fn clone_canceler<C: WakerWaiterCancel + Send + Sync + 'static>(
+        canceler: *const (),
+    ) -> RawCanceler {
+        unsafe { Arc::increment_strong_count(canceler as *const C) };
+
+        RawCanceler::new(canceler as *const (), VTablePerType::<C>::VTABLE)
+    }
+
+    unsafe fn cancel<C: WakerWaiterCancel + Send + Sync + 'static>(canceler: *const ()) {
+        let canceler = unsafe { ManuallyDrop::new(Arc::from_raw(canceler as *const C)) };
+        <C as WakerWaiterCancel>::cancel(&canceler);
+    }
+
+    unsafe fn drop_canceler<C: WakerWaiterCancel + Send + Sync + 'static>(canceler: *const ()) {
+        unsafe { Arc::decrement_strong_count(canceler as *const C) };
+    }
+
+    RawCanceler::new(
+        Arc::into_raw(canceler) as *const (),
+        VTablePerType::<C>::VTABLE,
     )
 }
 
@@ -547,7 +647,7 @@ impl WakerExt for Waker {
 }
 
 mod executor {
-    use super::{ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter};
+    use super::{ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter, WakerWaiterCanceler};
     use std::future::Future;
     use std::mem::MaybeUninit;
     use std::pin::pin;
@@ -557,7 +657,7 @@ mod executor {
 
     struct ThreadWaker {
         thread: Thread,
-        waiter: Arc<Mutex<Option<WakerWaiter>>>,
+        waiter_data: Arc<Mutex<Option<(WakerWaiter, WakerWaiterCanceler)>>>,
     }
 
     impl Wake for ThreadWaker {
@@ -569,12 +669,12 @@ mod executor {
                 return;
             }
 
-            let waiter = self.waiter.lock().unwrap().clone();
+            let waiter_data = self.waiter_data.lock().unwrap().clone();
 
-            if let Some(waiter) = waiter {
+            if let Some(waiter_data) = waiter_data {
                 // if a waiter was configured, then the execution thread
                 // will be blocking on it and we'll need to unblock it
-                waiter.cancel();
+                waiter_data.1.cancel();
             } else {
                 // if a waiter was not configured, then the execution
                 // thread will be asleep with a standard thread park
@@ -585,22 +685,27 @@ mod executor {
 
     #[derive(Clone)]
     struct MyTopLevelPoller {
-        waiter: Arc<Mutex<Option<WakerWaiter>>>,
+        waiter_data: Arc<Mutex<Option<(WakerWaiter, WakerWaiterCanceler)>>>,
     }
 
     impl TopLevelPoller for MyTopLevelPoller {
         fn set_waiter(&mut self, waiter: &WakerWaiter) -> Result<(), SetWaiterError> {
-            let self_waiter = &mut *self.waiter.lock().unwrap();
+            let waiter_data = &mut *self.waiter_data.lock().unwrap();
 
-            if let Some(cur) = self_waiter {
-                if cur == waiter {
+            if let Some(cur) = waiter_data {
+                if cur.0 == *waiter {
                     return Ok(()); // already set to this waiter
                 } else {
                     return Err(SetWaiterError); // already set to a different waiter
                 }
             }
 
-            *self_waiter = Some(waiter.clone());
+            let canceler = match waiter.canceler() {
+                Some(canceler) => canceler,
+                None => return Err(SetWaiterError),
+            };
+
+            *waiter_data = Some((waiter.clone(), canceler));
 
             Ok(())
         }
@@ -610,14 +715,15 @@ mod executor {
     where
         T: Future,
     {
-        let waiter = Arc::new(Mutex::new(None));
+        let waiter_data = Arc::new(Mutex::new(None));
+
         let mut poller = MyTopLevelPoller {
-            waiter: Arc::clone(&waiter),
+            waiter_data: Arc::clone(&waiter_data),
         };
 
         let waker = Arc::new(ThreadWaker {
             thread: thread::current(),
-            waiter,
+            waiter_data,
         })
         .into();
 
@@ -635,12 +741,12 @@ mod executor {
             match result {
                 Poll::Ready(res) => break res,
                 Poll::Pending => {
-                    let waiter = poller.waiter.lock().unwrap().clone();
+                    let waiter_data = poller.waiter_data.lock().unwrap().clone();
 
                     // if a waiter is configured then block on it. else do a
                     // standard thread park
-                    match waiter {
-                        Some(waiter) => waiter.wait(),
+                    match waiter_data {
+                        Some(waiter_data) => waiter_data.0.wait(),
                         None => thread::park(),
                     }
                 }
@@ -659,8 +765,7 @@ mod tests {
     use std::cell::RefCell;
     use std::future::Future;
     use std::pin::{pin, Pin};
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake};
+    use std::task::{Poll, Wake};
 
     struct NoopWaker;
 
@@ -690,13 +795,18 @@ mod tests {
         }
     }
 
+    struct NoopWakerWaiterCanceler;
+
+    impl WakerWaiterCancel for NoopWakerWaiterCanceler {
+        fn cancel(self: &Arc<Self>) {}
+    }
+
     struct NoopWakerWaiter;
 
     impl WakerWait for NoopWakerWaiter {
         fn wait(self: &Arc<Self>) {}
-        fn cancel(self: &Arc<Self>) {}
-        fn can_cancel(self: &Arc<Self>) -> bool {
-            false
+        fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler> {
+            Some(Arc::new(NoopWakerWaiterCanceler).into())
         }
     }
 
@@ -743,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_context_inherit() {
-        let waker = Arc::new(NoopWaker).into();
+        let waker: Waker = Arc::new(NoopWaker).into();
 
         let mut poller = MyTopLevelPoller {
             waiter: RefCell::new(None),
