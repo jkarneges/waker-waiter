@@ -5,7 +5,9 @@ mod tokio_integration {
     use std::sync::{Arc, Mutex, Weak};
     use std::task::{Context, Poll, Waker};
     use tokio::runtime;
-    use waker_waiter::{ContextExt, WakerWait, WakerWaiter};
+    use waker_waiter::{
+        ContextExt, WakerWait, WakerWaiter, WakerWaiterCancel, WakerWaiterCanceler,
+    };
 
     static WAITER_MANAGER: Mutex<Option<Arc<WaiterManager>>> = Mutex::new(None);
 
@@ -93,15 +95,17 @@ mod tokio_integration {
             println!("wait end");
         }
 
+        fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler> {
+            Some(Arc::clone(self).into())
+        }
+    }
+
+    impl WakerWaiterCancel for Waiter {
         fn cancel(self: &Arc<Self>) {
             if let Some(manager) = self.0.upgrade() {
                 // tell PendingOnce to complete
                 manager.wake();
             }
-        }
-
-        fn can_cancel(self: &Arc<Self>) -> bool {
-            true
         }
     }
 
