@@ -95,8 +95,8 @@ mod tokio_integration {
             println!("wait end");
         }
 
-        fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler> {
-            Some(Arc::clone(self).into())
+        fn canceler(self: &Arc<Self>) -> WakerWaiterCanceler {
+            Arc::clone(self).into()
         }
     }
 
