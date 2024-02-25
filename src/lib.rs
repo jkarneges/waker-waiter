@@ -62,7 +62,7 @@
 //!         todo!();
 //!     }
 //!
-//!     fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler> {
+//!     fn canceler(self: &Arc<Self>) -> WakerWaiterCanceler {
 //!         // ... provide a way to unblock the above ...
 //!         todo!();
 //!     }
@@ -118,7 +118,7 @@
 //!         if let Some(waiter) = waiter {
 //!             // if a waiter was configured, then the execution thread
 //!             // will be blocking on it and we'll need to unblock it
-//!             waiter.canceler().unwrap().cancel();
+//!             waiter.canceler().cancel();
 //!         } else {
 //!             // if a waiter was not configured, then the execution
 //!             // thread will be asleep with a standard thread park
@@ -306,10 +306,10 @@ impl WakerWaiter {
         unsafe { (self.inner.vtable.wait)(self.inner.data) }
     }
 
-    pub fn canceler(&self) -> Option<WakerWaiterCanceler> {
-        let raw = unsafe { (self.inner.vtable.canceler)(self.inner.data) };
+    pub fn canceler(&self) -> WakerWaiterCanceler {
+        let raw = unsafe { (self.inner.vtable.canceler)(self.inner.data).unwrap() };
 
-        raw.map(|v| WakerWaiterCanceler { inner: v })
+        WakerWaiterCanceler { inner: raw }
     }
 
     pub fn to_local(self) -> LocalWakerWaiter {
@@ -374,7 +374,7 @@ impl Drop for LocalWakerWaiter {
 
 pub trait WakerWait {
     fn wait(self: &Arc<Self>);
-    fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler>;
+    fn canceler(self: &Arc<Self>) -> WakerWaiterCanceler;
 }
 
 impl<W: WakerWait + Send + Sync + 'static> From<Arc<W>> for WakerWaiter {
@@ -413,9 +413,8 @@ fn raw_waiter<W: WakerWait + Send + Sync + 'static>(waiter: Arc<W>) -> RawWaiter
         waiter: *const (),
     ) -> Option<RawCanceler> {
         let waiter = unsafe { ManuallyDrop::new(Arc::from_raw(waiter as *const W)) };
-        let canceler = <W as WakerWait>::canceler(&waiter);
 
-        canceler.map(|v| v.into_raw())
+        Some(<W as WakerWait>::canceler(&waiter).into_raw())
     }
 
     unsafe fn drop_waiter<W: WakerWait + Send + Sync + 'static>(waiter: *const ()) {
@@ -700,12 +699,7 @@ mod executor {
                 }
             }
 
-            let canceler = match waiter.canceler() {
-                Some(canceler) => canceler,
-                None => return Err(SetWaiterError),
-            };
-
-            *waiter_data = Some((waiter.clone(), canceler));
+            *waiter_data = Some((waiter.clone(), waiter.canceler()));
 
             Ok(())
         }
@@ -805,8 +799,8 @@ mod tests {
 
     impl WakerWait for NoopWakerWaiter {
         fn wait(self: &Arc<Self>) {}
-        fn canceler(self: &Arc<Self>) -> Option<WakerWaiterCanceler> {
-            Some(Arc::new(NoopWakerWaiterCanceler).into())
+        fn canceler(self: &Arc<Self>) -> WakerWaiterCanceler {
+            Arc::new(NoopWakerWaiterCanceler).into()
         }
     }
 
