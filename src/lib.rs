@@ -1,8 +1,8 @@
 //! This library helps async runtimes support the execution of arbitrary futures, by enabling futures to provide their own event polling logic. It is an attempt to implement the approach described by [Context reactor hook](https://jblog.andbit.net/2022/12/28/context-reactor-hook/).
 //!
 //! There are two integration points:
-//! - Futures that need to run their own event polling logic in the execution thread must call [`ContextExt::top_level_poller`] to obtain a [`TopLevelPoller`] and then call [`TopLevelPoller::set_waiter`] to register a [`WakerWaiter`] on it.
-//! - Whatever part of the application that is responsible for polling top-level futures (i.e. the async runtime) needs to implement the [`TopLevelPoller`] trait and provide it using [`ContextExt::with_top_level_poller`]. This library provides such an implementation via [`block_on`].
+//! - Futures that need to run their own event polling logic in the execution thread must call [`get_poller`] to obtain a [`TopLevelPoller`] and then call [`TopLevelPoller::set_waiter`] to register a [`WakerWaiter`] on it.
+//! - Whatever part of the application that is responsible for polling top-level futures (i.e. the async runtime) needs to implement the [`TopLevelPoller`] trait and provide it using [`std::task::ContextBuilder::ext`]. This library provides such an implementation via [`block_on`].
 //!
 //! Only one [`WakerWaiter`] can be registered on a [`TopLevelPoller`]. If more than one future relies on the same event polling logic, the futures should coordinate and share the same [`WakerWaiter`].
 //!
@@ -14,7 +14,7 @@
 //! # use std::pin::Pin;
 //! # use std::sync::{Arc, Mutex, Weak};
 //! # use std::task::{Context, Poll};
-//! # use waker_waiter::{ContextExt, WakerWait, WakerWaiter, WakerWaiterCanceler};
+//! # use waker_waiter::{TopLevelPoller, WakerWait, WakerWaiter, WakerWaiterCanceler, get_poller};
 //! #
 //! static REACTOR: Mutex<Option<Arc<Reactor>>> = Mutex::new(None);
 //!
@@ -74,7 +74,7 @@
 //! #   type Output = ();
 //! #
 //!     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-//!         let p = match cx.top_level_poller() {
+//!         let p = match get_poller(cx) {
 //!             Some(p) => p,
 //!             None => panic!("MyFuture requires context to provide TopLevelPoller"),
 //!         };
@@ -92,13 +92,15 @@
 //! # Example of an executor providing a `TopLevelPoller`
 //!
 //! ```
+//! #![feature(local_waker)]
+//! #![feature(context_ext)]
 //! # use std::future::Future;
 //! # use std::mem::MaybeUninit;
 //! # use std::pin::{pin, Pin};
 //! # use std::sync::{Arc, Mutex};
-//! # use std::task::{Context, Poll, Wake};
+//! # use std::task::{Context, ContextBuilder, Poll, Wake};
 //! # use std::thread::{self, Thread};
-//! # use waker_waiter::{ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter};
+//! # use waker_waiter::{Anyable, SetWaiterError, TopLevelPoller, WakerWaiter};
 //! struct ThreadWaker {
 //!     thread: Thread,
 //!     waiter: Arc<Mutex<Option<WakerWaiter>>>,
@@ -162,9 +164,8 @@
 //!
 //! loop {
 //!    let result = {
-//!        let mut scratch = MaybeUninit::uninit();
-//!        let mut cx =
-//!            Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
+//!        let mut a = Anyable::new(&mut poller as &mut dyn TopLevelPoller);
+//!        let mut cx = ContextBuilder::from_waker(&waker).ext(a.as_any()).build();
 //!
 //!        fut.as_mut().poll(&mut cx)
 //!    };
@@ -185,13 +186,14 @@
 //! }
 //! ```
 
-#![feature(waker_getters)]
+#![feature(local_waker)]
+#![feature(context_ext)]
 
 use std::fmt;
-use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::mem::{self, transmute, ManuallyDrop};
 use std::ptr;
 use std::sync::Arc;
-use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+use std::task::Context;
 
 pub struct RawCancelerVTable {
     clone: unsafe fn(*const ()) -> RawCanceler,
@@ -503,155 +505,102 @@ pub trait TopLevelPoller {
     }
 }
 
-struct WakerWithTopLevelPoller<'a> {
-    inner: Waker,
-    poller: &'a mut dyn TopLevelPoller,
-}
+pub mod ctx_ref {
+    use std::any::Any;
+    use std::marker::PhantomData;
+    use std::task::Context;
 
-unsafe fn clone_fn(data: *const ()) -> RawWaker {
-    let w = (data as *const WakerWithTopLevelPoller).as_ref().unwrap();
+    // SAFETY: only implement on dyn types that don't expose
+    // lifetimes held by the type. i.e. traits with methods
+    // that only work with argument lifetimes. this allows
+    // us to safely cast any held lifetimes, because there
+    // is no way to move-in, move-out, or obtain a reference
+    // to data with any such held lifetimes
+    pub unsafe trait DynWithStaticInterface {
+        type Static: ?Sized + 'static;
+        type Clamped<'a>: ?Sized
+        where
+            Self: 'a;
 
-    let inner = ManuallyDrop::new(w.inner.clone());
-    let inner_raw = inner.as_raw();
+        // return type is safe to use because it does not expose
+        // whatever lifetimes were converted to 'static
+        fn to_static(&mut self) -> &mut Self::Static;
 
-    RawWaker::new(inner_raw.data(), inner_raw.vtable())
-}
-
-unsafe fn wake_fn(data: *const ()) {
-    let data = data as *mut WakerWithTopLevelPoller;
-    let w = Box::from_raw(data);
-
-    w.inner.wake();
-}
-
-unsafe fn wake_by_ref_fn(data: *const ()) {
-    let w = (data as *const WakerWithTopLevelPoller).as_ref().unwrap();
-
-    w.inner.wake_by_ref();
-}
-
-unsafe fn drop_fn(data: *const ()) {
-    let data = data as *mut WakerWithTopLevelPoller;
-    drop(Box::from_raw(data));
-}
-
-const VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
-
-impl<'a> WakerWithTopLevelPoller<'a> {
-    fn new(waker: Waker, poller: &'a mut dyn TopLevelPoller) -> Self {
-        Self {
-            inner: waker,
-            poller,
-        }
+        // return type is safe to use because it does not expose
+        // whatever lifetimes were converted to 'a
+        fn to_clamped<'a>(&'a mut self) -> &'a mut Self::Clamped<'a>;
     }
 
-    // caller must ensure poller outlives returned Waker
-    unsafe fn into_std(self) -> Waker {
-        let data = Box::new(self);
-        let rw = RawWaker::new(Box::into_raw(data) as *const (), &VTABLE);
+    struct AnyablePrivate<T: ?Sized>(*mut T);
 
-        unsafe { Waker::from_raw(rw) }
+    pub struct Anyable<'a, T: ?Sized, U: ?Sized> {
+        p: AnyablePrivate<T>,
+        _marker: PhantomData<&'a mut U>,
     }
 
-    fn try_from_raw(rw: &'a RawWaker) -> Option<&'a mut Self> {
-        if rw.vtable() == &VTABLE {
-            unsafe {
-                Some(
-                    (rw.data() as *mut WakerWithTopLevelPoller)
-                        .as_mut()
-                        .unwrap(),
-                )
+    impl<'a, T: DynWithStaticInterface + ?Sized> Anyable<'a, T::Static, T> {
+        pub fn new(r: &'a mut T) -> Self {
+            Self {
+                p: AnyablePrivate(r.to_static()),
+                _marker: PhantomData,
             }
-        } else {
-            None
-        }
-    }
-}
-
-pub trait ContextExt<'a> {
-    fn with_top_level_poller<'b: 'a>(
-        self,
-        poller: &'b mut dyn TopLevelPoller,
-        scratch: &'a mut MaybeUninit<Waker>,
-    ) -> Self;
-    fn top_level_poller(&mut self) -> Option<&mut dyn TopLevelPoller>;
-    fn with_waker<'b>(
-        &'b mut self,
-        waker: &'b Waker,
-        scratch: &'b mut MaybeUninit<Waker>,
-    ) -> Context<'b>;
-}
-
-impl<'a> ContextExt<'a> for Context<'a> {
-    fn with_top_level_poller<'b: 'a>(
-        self,
-        poller: &'b mut dyn TopLevelPoller,
-        scratch: &'a mut MaybeUninit<Waker>,
-    ) -> Self {
-        let waker = WakerWithTopLevelPoller::new(self.waker().clone(), poller);
-
-        // SAFETY: poller outlives waker
-        let waker = unsafe { waker.into_std() };
-
-        scratch.write(waker);
-
-        // SAFETY: data is initialized
-        let waker = unsafe { scratch.assume_init_ref() };
-
-        Self::from_waker(waker)
-    }
-
-    fn top_level_poller(&mut self) -> Option<&mut dyn TopLevelPoller> {
-        match WakerWithTopLevelPoller::try_from_raw(self.waker().as_raw()) {
-            Some(w) => Some(w.poller),
-            None => None,
         }
     }
 
-    fn with_waker<'b>(
-        &'b mut self,
-        waker: &'b Waker,
-        scratch: &'b mut MaybeUninit<Waker>,
-    ) -> Context<'b> {
-        match WakerWithTopLevelPoller::try_from_raw(self.waker().as_raw()) {
-            Some(w) => {
-                let waker = WakerWithTopLevelPoller::new(waker.clone(), w.poller);
-
-                // SAFETY: poller outlives waker
-                let waker = unsafe { waker.into_std() };
-
-                scratch.write(waker);
-
-                // SAFETY: data is initialized
-                let waker = unsafe { scratch.assume_init_ref() };
-
-                Context::from_waker(waker)
-            }
-            None => Context::from_waker(waker),
+    impl<T: ?Sized + 'static, U: ?Sized> Anyable<'_, T, U> {
+        pub fn as_any<'a>(&'a mut self) -> &'a mut (dyn Any + 'static) {
+            &mut self.p
         }
+    }
+
+    pub fn ctx_downcast<'a, T: DynWithStaticInterface + ?Sized + 'static>(
+        cx: &mut Context<'a>,
+    ) -> Option<&'a mut T::Clamped<'a>> {
+        let a = cx.ext();
+
+        let p = match a.downcast_mut::<AnyablePrivate<T>>() {
+            Some(p) => p,
+            None => return None,
+        };
+
+        // SAFETY: the inner pointer is guaranteed to be valid because
+        // p has the same lifetime as the reference that was
+        // originally casted to the pointer
+        let r: &'a mut T = unsafe { p.0.as_mut().unwrap() };
+
+        Some(r.to_clamped())
     }
 }
 
-pub trait WakerExt {
-    fn will_wake2(&self, other: &Waker) -> bool;
+use ctx_ref::{ctx_downcast, DynWithStaticInterface};
+
+pub use ctx_ref::Anyable;
+
+// SAFETY: implementing on a dyn type that does not expose any lifetimes held by the type
+unsafe impl DynWithStaticInterface for (dyn TopLevelPoller + '_) {
+    type Static = dyn TopLevelPoller + 'static;
+    type Clamped<'a> = dyn TopLevelPoller + 'a;
+
+    fn to_static(&mut self) -> &mut Self::Static {
+        unsafe { transmute(self) }
+    }
+
+    fn to_clamped<'a>(&'a mut self) -> &'a mut Self::Clamped<'a> {
+        unsafe { transmute(self) }
+    }
 }
 
-impl WakerExt for Waker {
-    fn will_wake2(&self, other: &Waker) -> bool {
-        match WakerWithTopLevelPoller::try_from_raw(self.as_raw()) {
-            Some(w) => w.inner.will_wake(other),
-            None => self.will_wake(other),
-        }
-    }
+pub fn get_poller<'a>(cx: &mut Context<'a>) -> Option<&'a mut (dyn TopLevelPoller + 'a)> {
+    ctx_downcast::<dyn TopLevelPoller>(cx)
 }
 
 mod executor {
-    use super::{ContextExt, SetWaiterError, TopLevelPoller, WakerWaiter, WakerWaiterCanceler};
+    use super::Anyable;
+    use super::{SetWaiterError, TopLevelPoller, WakerWaiter, WakerWaiterCanceler};
     use std::future::Future;
-    use std::mem::MaybeUninit;
     use std::pin::pin;
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Wake};
+    use std::task::{ContextBuilder, Poll, Wake};
     use std::thread::{self, Thread};
 
     struct ThreadWaker {
@@ -683,7 +632,7 @@ mod executor {
     }
 
     #[derive(Clone)]
-    struct MyTopLevelPoller {
+    pub struct MyTopLevelPoller {
         waiter_data: Arc<Mutex<Option<(WakerWaiter, WakerWaiterCanceler)>>>,
     }
 
@@ -725,9 +674,8 @@ mod executor {
 
         let res = loop {
             let result = {
-                let mut scratch = MaybeUninit::uninit();
-                let mut cx =
-                    Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
+                let mut a = Anyable::new(&mut poller as &mut dyn TopLevelPoller);
+                let mut cx = ContextBuilder::from_waker(&waker).ext(a.as_any()).build();
 
                 fut.as_mut().poll(&mut cx)
             };
@@ -759,7 +707,7 @@ mod tests {
     use std::cell::RefCell;
     use std::future::Future;
     use std::pin::{pin, Pin};
-    use std::task::{Poll, Wake};
+    use std::task::{ContextBuilder, Poll, Wake};
 
     struct NoopWaker;
 
@@ -825,19 +773,17 @@ mod tests {
             // is constructed (or when some parent owner is constructed)
 
             let waker = Arc::new(NoopWaker).into();
-            let mut scratch = MaybeUninit::uninit();
-            let mut cx1 = cx.with_waker(&waker, &mut scratch);
+            let mut cx1 = ContextBuilder::from(cx).waker(&waker).build();
 
-            // should be cheap: looking up a thread local
-            // NOTE: later on, this could become a property of Context
-            let p = match cx1.top_level_poller() {
+            // should be cheap
+            let poller = match get_poller(&mut cx1) {
                 Some(p) => p,
                 None => panic!("MyFuture requires context to provide TopLevelPoller"),
             };
 
             // can be cheap: it's up to the setter impl, but this
             // could just be a pointer comparison
-            if p.set_waiter(&self.waiter).is_err() {
+            if poller.set_waiter(&self.waiter).is_err() {
                 panic!("Incompatible WakerWaiter already assigned to context's TopLevelPoller");
             }
 
@@ -845,31 +791,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_context_inherit() {
-        let waker: Waker = Arc::new(NoopWaker).into();
+    struct MyFuture2 {
+        waiter: WakerWaiter,
+    }
 
-        let mut poller = MyTopLevelPoller {
-            waiter: RefCell::new(None),
-        };
-
-        let mut scratch = MaybeUninit::uninit();
-        let mut cx = Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
-
-        assert!(cx.waker().will_wake2(&waker));
-        assert!(cx.top_level_poller().is_some());
-
-        {
-            let waker = Arc::new(NoopWaker).into();
-            let mut scratch = MaybeUninit::uninit();
-            let mut cx2 = cx.with_waker(&waker, &mut scratch);
-
-            assert!(cx2.waker().will_wake2(&waker));
-            assert!(cx2.top_level_poller().is_some());
+    impl MyFuture2 {
+        fn new() -> Self {
+            Self {
+                waiter: Arc::new(NoopWakerWaiter).into(),
+            }
         }
+    }
 
-        assert!(cx.waker().will_wake2(&waker));
-        assert!(cx.top_level_poller().is_some());
+    impl Future for MyFuture2 {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+            // first, apply WakerWaiter
+            // NOTE: alternatively, the lookup/set could happen when MyFuture
+            // is constructed (or when some parent owner is constructed)
+
+            let waker = Arc::new(NoopWaker).into();
+            let mut cx1 = ContextBuilder::from(cx).waker(&waker).build();
+
+            // should be cheap
+            let poller = match get_poller(&mut cx1) {
+                Some(p) => p,
+                None => panic!("MyFuture requires context to provide TopLevelPoller"),
+            };
+
+            // can be cheap: it's up to the setter impl, but this
+            // could just be a pointer comparison
+            if poller.set_waiter(&self.waiter).is_err() {
+                panic!("Incompatible WakerWaiter already assigned to context's TopLevelPoller");
+            }
+
+            Poll::Ready(())
+        }
     }
 
     #[test]
@@ -884,9 +842,8 @@ mod tests {
 
         loop {
             let result = {
-                let mut scratch = MaybeUninit::uninit();
-                let mut cx =
-                    Context::from_waker(&waker).with_top_level_poller(&mut poller, &mut scratch);
+                let mut a = Anyable::new(&mut poller as &mut dyn TopLevelPoller);
+                let mut cx = ContextBuilder::from_waker(&waker).ext(a.as_any()).build();
 
                 fut.as_mut().poll(&mut cx)
             };
@@ -903,6 +860,6 @@ mod tests {
 
     #[test]
     fn test_block_on() {
-        block_on(MyFuture::new());
+        block_on(MyFuture2::new());
     }
 }

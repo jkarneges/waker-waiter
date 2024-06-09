@@ -1,3 +1,5 @@
+#![feature(context_ext)]
+
 mod tokio_integration {
     use std::future::Future;
     use std::io;
@@ -6,7 +8,7 @@ mod tokio_integration {
     use std::task::{Context, Poll, Waker};
     use tokio::runtime;
     use waker_waiter::{
-        ContextExt, WakerWait, WakerWaiter, WakerWaiterCancel, WakerWaiterCanceler,
+        get_poller, WakerWait, WakerWaiter, WakerWaiterCancel, WakerWaiterCanceler,
     };
 
     static WAITER_MANAGER: Mutex<Option<Arc<WaiterManager>>> = Mutex::new(None);
@@ -154,12 +156,15 @@ mod tokio_integration {
         type Output = ();
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-            let p = match cx.top_level_poller() {
+            let poller = match get_poller(cx) {
                 Some(p) => p,
                 None => panic!("Thread does not provide TopLevelPoller"),
             };
 
-            if p.set_waiter(WaiterManager::current().waiter()).is_err() {
+            if poller
+                .set_waiter(WaiterManager::current().waiter())
+                .is_err()
+            {
                 panic!("Incompatible waiter already assigned to TopLevelPoller");
             }
 
